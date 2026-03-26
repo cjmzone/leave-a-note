@@ -45,6 +45,28 @@ type SignedRequestParams = {
   contentType?: string;
 };
 
+function buildUploadTarget(host: string, bucket: string, encodedKey: string): string {
+  return `https://${host}/${bucket}/${encodedKey}`;
+}
+
+function getErrorCause(error: unknown): unknown {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+
+  return (error as { cause?: unknown }).cause;
+}
+
+function getErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+
+  return typeof (error as { code?: unknown }).code === "string"
+    ? ((error as { code?: string }).code ?? undefined)
+    : undefined;
+}
+
 async function sendSignedR2Request({
   method,
   key,
@@ -54,7 +76,8 @@ async function sendSignedR2Request({
   const host = `${env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`;
   const encodedKey = encodeObjectKey(key);
   const path = `/${env.CLOUDFLARE_R2_BUCKET}/${encodedKey}`;
-  const url = `https://${host}${path}`;
+  const target = buildUploadTarget(host, env.CLOUDFLARE_R2_BUCKET, encodedKey);
+  const url = `${target}`;
 
   const now = new Date();
   const { amzDate, dateStamp } = toAmzDate(now);
@@ -117,16 +140,45 @@ async function sendSignedR2Request({
     headers.set("Content-Type", contentType);
   }
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: body ? new Uint8Array(body) : undefined,
-  });
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      method,
+      headers,
+      body: body ? new Uint8Array(body) : undefined,
+    });
+  } catch (requestError) {
+    const requestCause = getErrorCause(requestError);
+    const causeMessage =
+      requestCause instanceof Error ? requestCause.message : undefined;
+
+    console.error("[r2] request failed", {
+      method,
+      target,
+      code: getErrorCode(requestError) ?? getErrorCode(requestCause),
+      message:
+        requestError instanceof Error ? requestError.message : "Unknown fetch error",
+      cause: causeMessage,
+    });
+
+    throw requestError;
+  }
 
   if (!response.ok) {
     const errorBody = await response.text().catch(() => "");
+    console.error("[r2] non-2xx response", {
+      method,
+      target,
+      status: response.status,
+      statusText: response.statusText || undefined,
+      body: errorBody.slice(0, 500),
+    });
     throw new Error(`R2 ${method} failed: HTTP ${response.status} ${errorBody}`);
   }
+
+  // Consume successful response bodies so connections are reliably released.
+  await response.arrayBuffer().catch(() => undefined);
 }
 
 export function createR2BucketClient(): R2BucketClient {
