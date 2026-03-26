@@ -32,7 +32,7 @@ export async function uploadCanvasImage({
   });
 
   if (error) {
-    throw new Error("Failed to upload drawing image.");
+    throw new Error(`Failed to upload drawing image: ${error.message}`);
   }
 
   const { data } = bucketClient.getPublicUrl(filePath);

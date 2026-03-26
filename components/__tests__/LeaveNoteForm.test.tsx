@@ -95,4 +95,51 @@ describe("LeaveNoteForm", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(onPostCreated).not.toHaveBeenCalled();
   });
+
+  it("opens a dismissible modal for the one-post-per-day rate-limit case", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.mocked(fetch);
+
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 429,
+      json: async () => ({ error: "You can only create one post per day." }),
+    } as Response);
+
+    render(<LeaveNoteForm onPostCreated={vi.fn()} />);
+
+    await user.type(screen.getByLabelText(/short note/i), "Rate limit test");
+    await user.click(screen.getByRole("button", { name: /post anonymously/i }));
+
+    expect(
+      await screen.findByText("Sorry, you can only make one post a day.")
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /close/i }));
+
+    expect(
+      screen.queryByText("Sorry, you can only make one post a day.")
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps non-rate-limit errors as inline messages", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.mocked(fetch);
+
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: async () => ({ error: "Failed to save post." }),
+    } as Response);
+
+    render(<LeaveNoteForm onPostCreated={vi.fn()} />);
+
+    await user.type(screen.getByLabelText(/short note/i), "Server error test");
+    await user.click(screen.getByRole("button", { name: /post anonymously/i }));
+
+    expect(await screen.findByText("Failed to save post.")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Sorry, you can only make one post a day.")
+    ).not.toBeInTheDocument();
+  });
 });

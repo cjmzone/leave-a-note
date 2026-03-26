@@ -6,7 +6,7 @@ Simple anonymous web app where users draw on a p5.js canvas, add a short note, a
 - Next.js (App Router) + TypeScript
 - p5.js drawing board
 - Next.js API routes for backend
-- Supabase Postgres + Storage
+- Cloudflare D1 (SQLite) + R2 (image storage)
 - Tailwind CSS
 
 ## Project structure
@@ -19,49 +19,48 @@ leave-a-note/
 │   ├── globals.css
 │   ├── layout.tsx
 │   └── page.tsx
+├── cloudflare/
+│   └── schema.sql
 ├── components/
 │   ├── DrawingBoard.tsx
 │   ├── LeaveNoteForm.tsx
 │   └── PostFeed.tsx
 ├── lib/
+│   ├── cloudflareD1.ts
 │   ├── constants.ts
 │   ├── env.ts
+│   ├── imageUpload.ts
 │   ├── ip.ts
-│   └── supabaseAdmin.ts
-├── supabase/
-│   └── schema.sql
+│   └── r2.ts
 ├── types/
 │   └── post.ts
 ├── .env.example
 ├── package.json
-├── postcss.config.js
-├── tailwind.config.ts
-├── tsconfig.json
 └── README.md
 ```
 
 ## Database schema
-`supabase/schema.sql` creates:
+`cloudflare/schema.sql` creates:
 
 - `posts`
-  - `id` (uuid)
-  - `image_url` (text)
-  - `note_text` (text)
-  - `created_at` (timestamptz)
+  - `id` (TEXT)
+  - `image_url` (TEXT)
+  - `note_text` (TEXT)
+  - `created_at` (ISO timestamp text)
 - `post_rate_limits`
-  - `id` (uuid)
-  - `ip_hash` (text)
-  - `last_post_date` (date)
-  - `created_at` (timestamptz)
+  - `id` (TEXT)
+  - `ip_hash` (TEXT)
+  - `last_post_date` (YYYY-MM-DD text)
+  - `created_at` (ISO timestamp text)
 
 Rate limit enforcement uses a unique constraint on `(ip_hash, last_post_date)`.
 
-## Supabase setup assumptions
-- You have a Supabase project with Postgres enabled.
-- You run `supabase/schema.sql` in the SQL Editor.
-- You create a **public** Storage bucket named `post-images` (or set `SUPABASE_POST_IMAGES_BUCKET`).
-- API routes use `SUPABASE_SERVICE_ROLE_KEY` server-side for DB/storage operations.
-- Client remains anonymous (no auth, no accounts).
+## Cloudflare setup assumptions
+- Cloudflare account exists.
+- D1 database exists.
+- R2 bucket exists.
+- R2 bucket is publicly readable via `CLOUDFLARE_R2_PUBLIC_BASE_URL`.
+- API token/keys have D1 query permissions and R2 read/write access.
 
 ## API endpoints
 - `GET /api/posts`
@@ -69,15 +68,15 @@ Rate limit enforcement uses a unique constraint on `(ip_hash, last_post_date)`.
 - `POST /api/posts`
   - Body: `{ noteText: string, imageDataUrl: string }`
   - Validates note length server-side.
-  - Hashes client IP (with salt) and enforces one post/day.
-  - Uploads canvas PNG to Supabase Storage.
-  - Stores post record in `posts`.
+  - Hashes client IP and enforces one post/day.
+  - Uploads canvas PNG to R2.
+  - Stores post record in D1.
 
 ## Rate limiting
 - IP inferred from request headers (`x-forwarded-for`, `x-real-ip`, `cf-connecting-ip`).
 - Raw IP is never stored.
 - `SHA-256(ip + IP_HASH_SALT)` is stored in `post_rate_limits`.
-- Daily limit key uses UTC date (`YYYY-MM-DD`).
+- Daily key uses UTC date (`YYYY-MM-DD`).
 
 ## Environment variables
 Copy `.env.example` to `.env.local` and fill values:
@@ -87,11 +86,14 @@ cp .env.example .env.local
 ```
 
 Required:
-- `NEXT_PUBLIC_SUPABASE_URL`
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY` (kept for completeness, not required by current client code)
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `SUPABASE_POST_IMAGES_BUCKET` (default: `post-images`)
-- `IP_HASH_SALT` (random secret string)
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_D1_DATABASE_ID`
+- `CLOUDFLARE_R2_ACCESS_KEY_ID`
+- `CLOUDFLARE_R2_SECRET_ACCESS_KEY`
+- `CLOUDFLARE_R2_BUCKET` (default expected: `post-images`)
+- `CLOUDFLARE_R2_PUBLIC_BASE_URL`
+- `IP_HASH_SALT`
 
 ## Local setup
 1. Install dependencies:
@@ -99,9 +101,12 @@ Required:
    npm install
    ```
 2. Configure `.env.local`.
-3. Run SQL from `supabase/schema.sql` in Supabase.
-4. Create the Storage bucket.
-5. Start app:
+3. Apply schema to D1 (Wrangler example):
+   ```bash
+   npx wrangler d1 execute <YOUR_DB_NAME> --remote --file=cloudflare/schema.sql
+   ```
+   Or run SQL from `cloudflare/schema.sql` in the Cloudflare dashboard query editor.
+4. Start app:
    ```bash
    npm run dev
    ```
@@ -121,13 +126,3 @@ Open [http://localhost:3000](http://localhost:3000).
   ```bash
   npm run test:all
   ```
-
-Test coverage includes:
-- `POST /api/posts` success path, rate-limit rejection, and validation failures
-- `GET /api/posts` reverse-chronological query behavior
-- Hashed IP utility behavior
-- Image upload abstraction behavior
-- Form submit integration boundary with mocked drawing canvas
-- Feed rendering and empty state
-- MVP permanence assumption (no edit/delete route handlers)
-# leave-a-note

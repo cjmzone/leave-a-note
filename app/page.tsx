@@ -26,7 +26,10 @@ export default function HomePage() {
       const payload = await response.json().catch(() => null);
 
       if (!response.ok) {
-        throw new Error(payload?.error ?? "Could not load posts.");
+        throw new Error(
+          payload?.error ??
+            `Could not load posts (HTTP ${response.status}). Check server logs for details.`
+        );
       }
 
       setPosts((payload?.posts as Post[]) ?? []);

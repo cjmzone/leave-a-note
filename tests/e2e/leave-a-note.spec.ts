@@ -90,5 +90,7 @@ test("edge case: rate-limit error is shown to the user", async ({ page }) => {
   await page.getByLabel("Short note").fill("Will be rate limited");
   await page.getByRole("button", { name: "Post Anonymously" }).click();
 
-  await expect(page.getByText("You can only create one post per day.")).toBeVisible();
+  await expect(
+    page.getByText("Sorry, you can only make one post a day.")
+  ).toBeVisible();
 });

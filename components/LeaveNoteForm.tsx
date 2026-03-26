@@ -36,6 +36,7 @@ export default function LeaveNoteForm({ onPostCreated }: LeaveNoteFormProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [isRateLimitModalOpen, setIsRateLimitModalOpen] = useState(false);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -58,6 +59,7 @@ export default function LeaveNoteForm({ onPostCreated }: LeaveNoteFormProps) {
       setIsSubmitting(true);
       setErrorMessage(null);
       setSuccessMessage(null);
+      setIsRateLimitModalOpen(false);
 
       const imageBlob = await boardRef.current.exportImageBlob();
       const imageDataUrl = await convertBlobToDataUrl(imageBlob);
@@ -76,7 +78,22 @@ export default function LeaveNoteForm({ onPostCreated }: LeaveNoteFormProps) {
       const payload = await response.json().catch(() => null);
 
       if (!response.ok) {
-        throw new Error(payload?.error ?? "Could not create the post.");
+        const isDailyRateLimit =
+          response.status === 429 &&
+          typeof payload?.error === "string" &&
+          /one post per day/i.test(payload.error);
+
+        if (isDailyRateLimit) {
+          setErrorMessage(null);
+          setSuccessMessage(null);
+          setIsRateLimitModalOpen(true);
+          return;
+        }
+
+        throw new Error(
+          payload?.error ??
+            `Could not create the post (HTTP ${response.status}). Check server logs for details.`
+        );
       }
 
       onPostCreated(payload.post as Post);
@@ -135,6 +152,29 @@ export default function LeaveNoteForm({ onPostCreated }: LeaveNoteFormProps) {
       >
         {isSubmitting ? "Posting..." : "Post Anonymously"}
       </button>
+
+      {isRateLimitModalOpen ? (
+        <div
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+          role="dialog"
+        >
+          <div className="w-full max-w-sm rounded-md bg-white p-4 shadow-lg">
+            <p className="text-sm text-slate-900">
+              Sorry, you can only make one post a day.
+            </p>
+            <div className="mt-4 flex justify-end">
+              <button
+                className="rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700"
+                onClick={() => setIsRateLimitModalOpen(false)}
+                type="button"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </form>
   );
 }
