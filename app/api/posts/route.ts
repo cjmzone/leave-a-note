@@ -20,6 +20,10 @@ type PostRecord = {
   created_at: string;
 };
 
+type RateLimitRow = {
+  id: string;
+};
+
 type ErrorInfo = {
   code?: string;
   message?: string;
@@ -138,13 +142,25 @@ function logApiError(context: string, rawError?: unknown): void {
   });
 }
 
+function maskIpHash(ipHash: string): string {
+  return ipHash.slice(0, 12);
+}
+
+function logRateLimitDebug(
+  message: string,
+  details: Record<string, unknown>
+): void {
+  console.info(`[api/posts] ${message}`, details);
+}
+
 function isRateLimitConflictError(rawError: unknown): boolean {
-  const { code, message, details } = extractErrorInfo(rawError);
-  const normalized = `${code ?? ""} ${message ?? ""} ${details ?? ""}`.toLowerCase();
+  const { message, details } = extractErrorInfo(rawError);
+  const normalized = `${message ?? ""} ${details ?? ""}`.toLowerCase();
 
   return (
-    normalized.includes("unique") ||
-    normalized.includes("constraint failed")
+    normalized.includes("unique") &&
+    normalized.includes("post_rate_limits") &&
+    normalized.includes("last_post_date")
   );
 }
 
@@ -211,16 +227,78 @@ export async function POST(request: NextRequest) {
   const ipHash = hashIp(ip);
   const todayDate = getTodayDateUtc();
   const isDevelopmentMode = process.env.NODE_ENV === "development";
+  const maskedIpHash = maskIpHash(ipHash);
 
-  // Reserve the daily slot first. Unique constraint enforces one post/IP/day.
   if (!isDevelopmentMode) {
+    logRateLimitDebug("rate limit check started", {
+      nodeEnv: process.env.NODE_ENV ?? "undefined",
+      ipHash: maskedIpHash,
+      todayDateUtc: todayDate,
+    });
+
+    let existingRateLimitRows: RateLimitRow[];
+
+    try {
+      existingRateLimitRows = await d1Query<RateLimitRow>(
+        "SELECT id FROM post_rate_limits WHERE ip_hash = ? AND last_post_date = ? LIMIT 1",
+        [ipHash, todayDate]
+      );
+    } catch (rateLimitLookupError) {
+      const setupHint = buildSetupHint(rateLimitLookupError);
+      logApiError("Rate limit lookup failed", rateLimitLookupError);
+      logRateLimitDebug("rate limit branch selected", {
+        branch: "lookup_error",
+        ipHash: maskedIpHash,
+        todayDateUtc: todayDate,
+      });
+      return NextResponse.json(
+        {
+          error: buildDevErrorMessage(
+            setupHint
+              ? `Failed to verify rate limit. ${setupHint}`
+              : "Failed to verify rate limit.",
+            rateLimitLookupError
+          ),
+        },
+        { status: 500 }
+      );
+    }
+
+    logRateLimitDebug("rate limit lookup result", {
+      ipHash: maskedIpHash,
+      todayDateUtc: todayDate,
+      existingRowCount: existingRateLimitRows.length,
+    });
+
+    if (existingRateLimitRows.length > 0) {
+      logRateLimitDebug("rate limit branch selected", {
+        branch: "lookup_hit",
+        ipHash: maskedIpHash,
+        todayDateUtc: todayDate,
+      });
+      return NextResponse.json(
+        { error: "You can only create one post per day." },
+        { status: 429 }
+      );
+    }
+
+    // Reserve the daily slot before upload/insert. Unique constraint handles races.
     try {
       await d1Execute(
         "INSERT INTO post_rate_limits (id, ip_hash, last_post_date, created_at) VALUES (?, ?, ?, ?)",
         [randomUUID(), ipHash, todayDate, new Date().toISOString()]
       );
+      logRateLimitDebug("rate limit reservation inserted", {
+        ipHash: maskedIpHash,
+        todayDateUtc: todayDate,
+      });
     } catch (rateLimitError) {
       if (isRateLimitConflictError(rateLimitError)) {
+        logRateLimitDebug("rate limit branch selected", {
+          branch: "insert_conflict_hit",
+          ipHash: maskedIpHash,
+          todayDateUtc: todayDate,
+        });
         return NextResponse.json(
           { error: "You can only create one post per day." },
           { status: 429 }
@@ -229,6 +307,11 @@ export async function POST(request: NextRequest) {
 
       const setupHint = buildSetupHint(rateLimitError);
       logApiError("Rate limit insert failed", rateLimitError);
+      logRateLimitDebug("rate limit branch selected", {
+        branch: "insert_error",
+        ipHash: maskedIpHash,
+        todayDateUtc: todayDate,
+      });
       return NextResponse.json(
         {
           error: buildDevErrorMessage(
@@ -241,6 +324,13 @@ export async function POST(request: NextRequest) {
         { status: 500 }
       );
     }
+  } else {
+    logRateLimitDebug("rate limit skipped", {
+      branch: "development_bypass",
+      nodeEnv: process.env.NODE_ENV ?? "undefined",
+      ipHash: maskedIpHash,
+      todayDateUtc: todayDate,
+    });
   }
 
   const bucketClient = createR2BucketClient();

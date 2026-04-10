@@ -142,4 +142,29 @@ describe("LeaveNoteForm", () => {
       screen.queryByText("Sorry, you can only make one post a day.")
     ).not.toBeInTheDocument();
   });
+
+  it("does not open the rate-limit modal for infra-style 429 responses", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.mocked(fetch);
+
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 429,
+      json: async () => ({
+        error: "Failed to verify rate limit. code=7500 | internal error; reference=abc123",
+      }),
+    } as Response);
+
+    render(<LeaveNoteForm onPostCreated={vi.fn()} />);
+
+    await user.type(screen.getByLabelText(/short note/i), "Infra 429 test");
+    await user.click(screen.getByRole("button", { name: /post anonymously/i }));
+
+    expect(
+      await screen.findByText(/failed to verify rate limit/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Sorry, you can only make one post a day.")
+    ).not.toBeInTheDocument();
+  });
 });

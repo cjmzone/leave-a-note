@@ -53,15 +53,11 @@ export default function HomePage() {
   return (
     <main className="mx-auto max-w-6xl space-y-8 px-4 pb-16 pt-6 sm:px-6 sm:pt-8 lg:pb-20">
       <header className="space-y-3 text-center sm:text-left">
-        <p className="inline-flex border border-sky-200 bg-white/80 px-3 py-1 text-xs font-semibold tracking-wide text-sky-700">
-          Anonymous Public Canvas
-        </p>
+        
         <h1 className="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">
           Leave a Note
         </h1>
-        <p className="mx-auto max-w-2xl text-sm text-slate-600 sm:mx-0 sm:text-base">
-          Anonymous drawings and short notes. One post per IP address each UTC day.
-        </p>
+      
       </header>
 
       <section className="border border-sky-200/70 bg-white/90 p-4 shadow-[0_16px_36px_-22px_rgba(15,23,42,0.6)] backdrop-blur sm:p-6">

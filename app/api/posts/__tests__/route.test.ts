@@ -32,7 +32,9 @@ const VALID_IMAGE_DATA_URL = `data:image/png;base64,${Buffer.from("fake-image-by
 type TestScenario = {
   getPosts?: Array<{ id: string; image_url: string; note_text: string; created_at: string }>;
   getPostsError?: { code?: string; message: string; details?: string } | null;
-  rateLimitError?: { code?: string; message: string; details?: string } | null;
+  rateLimitLookupRows?: Array<{ id: string }>;
+  rateLimitLookupError?: { code?: string; message: string; details?: string } | null;
+  rateLimitInsertError?: { code?: string; message: string; details?: string } | null;
   uploadError?: { message: string } | null;
   insertPostError?: { code?: string; message: string; details?: string } | null;
 };
@@ -42,15 +44,36 @@ function configureScenario(scenario: TestScenario = {}) {
   mocks.d1Execute.mockReset();
   mocks.createR2BucketClient.mockReset();
 
-  if (scenario.getPostsError) {
-    mocks.d1Query.mockRejectedValue(scenario.getPostsError);
-  } else {
-    mocks.d1Query.mockResolvedValue(scenario.getPosts ?? []);
-  }
+  mocks.d1Query.mockImplementation(async (sql: string) => {
+    if (sql.startsWith("SELECT id, image_url, note_text, created_at FROM posts")) {
+      if (scenario.getPostsError) {
+        throw scenario.getPostsError;
+      }
+
+      return scenario.getPosts ?? [];
+    }
+
+    if (
+      sql.startsWith(
+        "SELECT id FROM post_rate_limits WHERE ip_hash = ? AND last_post_date = ? LIMIT 1"
+      )
+    ) {
+      if (scenario.rateLimitLookupError) {
+        throw scenario.rateLimitLookupError;
+      }
+
+      return scenario.rateLimitLookupRows ?? [];
+    }
+
+    return [];
+  });
 
   mocks.d1Execute.mockImplementation(async (sql: string) => {
-    if (sql.startsWith("INSERT INTO post_rate_limits") && scenario.rateLimitError) {
-      throw scenario.rateLimitError;
+    if (
+      sql.startsWith("INSERT INTO post_rate_limits") &&
+      scenario.rateLimitInsertError
+    ) {
+      throw scenario.rateLimitInsertError;
     }
 
     if (sql.startsWith("INSERT INTO posts") && scenario.insertPostError) {
@@ -97,10 +120,12 @@ describe("/api/posts route", () => {
     vi.clearAllMocks();
     mocks.getClientIp.mockReturnValue("203.0.113.10");
     mocks.hashIp.mockReturnValue("hashed-ip-value");
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
   });
 
   afterEach(() => {
     process.env.NODE_ENV = originalNodeEnv;
+    vi.restoreAllMocks();
   });
 
   it("GET returns posts and requests reverse-chronological ordering", async () => {
@@ -160,6 +185,10 @@ describe("/api/posts route", () => {
     expect(response.status).toBe(201);
     expect(mocks.getClientIp).toHaveBeenCalledTimes(1);
     expect(mocks.hashIp).toHaveBeenCalledWith("203.0.113.10");
+    expect(context.d1Query).toHaveBeenCalledWith(
+      "SELECT id FROM post_rate_limits WHERE ip_hash = ? AND last_post_date = ? LIMIT 1",
+      ["hashed-ip-value", expect.any(String)]
+    );
 
     const d1Calls = context.d1Execute.mock.calls.map((entry) => entry[0] as string);
     expect(d1Calls.some((sql) => sql.startsWith("INSERT INTO post_rate_limits"))).toBe(true);
@@ -182,9 +211,35 @@ describe("/api/posts route", () => {
     });
   });
 
-  it("POST blocks a second post on the same day when the daily rate-limit row already exists", async () => {
+  it("POST returns 429 when the daily rate-limit row already exists for the IP hash/date", async () => {
+    process.env.NODE_ENV = "production";
+
     const context = configureScenario({
-      rateLimitError: {
+      rateLimitLookupRows: [{ id: "existing-row-id" }],
+    });
+
+    const response = await POST(
+      createPostRequest({
+        noteText: "Second attempt",
+        imageDataUrl: VALID_IMAGE_DATA_URL,
+      })
+    );
+
+    const payload = await response.json();
+
+    expect(response.status).toBe(429);
+    expect(payload.error).toMatch(/one post per day/i);
+    expect(context.upload).not.toHaveBeenCalled();
+    expect(
+      context.d1Execute.mock.calls.some((entry) =>
+        (entry[0] as string).startsWith("INSERT INTO post_rate_limits")
+      )
+    ).toBe(false);
+  });
+
+  it("POST returns 429 on reservation insert conflict (race-safe true rate-limit hit)", async () => {
+    const context = configureScenario({
+      rateLimitInsertError: {
         message:
           "UNIQUE constraint failed: post_rate_limits.ip_hash, post_rate_limits.last_post_date",
       },
@@ -192,7 +247,7 @@ describe("/api/posts route", () => {
 
     const response = await POST(
       createPostRequest({
-        noteText: "Second attempt",
+        noteText: "Insert conflict branch",
         imageDataUrl: VALID_IMAGE_DATA_URL,
       })
     );
@@ -208,7 +263,7 @@ describe("/api/posts route", () => {
     process.env.NODE_ENV = "development";
 
     const context = configureScenario({
-      rateLimitError: {
+      rateLimitInsertError: {
         message:
           "UNIQUE constraint failed: post_rate_limits.ip_hash, post_rate_limits.last_post_date",
       },
@@ -227,7 +282,63 @@ describe("/api/posts route", () => {
     expect(d1Calls.some((sql) => sql.startsWith("INSERT INTO post_rate_limits"))).toBe(
       false
     );
+    expect(
+      context.d1Query.mock.calls.some((entry) =>
+        (entry[0] as string).startsWith("SELECT id FROM post_rate_limits")
+      )
+    ).toBe(false);
     expect(context.upload).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST returns infra error when the rate-limit lookup query fails", async () => {
+    const context = configureScenario({
+      rateLimitLookupError: {
+        code: "7500",
+        message: "Cloudflare D1 request failed",
+        details: "internal error; reference = lookup-failure-1",
+      },
+    });
+
+    const response = await POST(
+      createPostRequest({
+        noteText: "Lookup failure branch",
+        imageDataUrl: VALID_IMAGE_DATA_URL,
+      })
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(payload.error).toMatch(/failed to verify rate limit/i);
+    expect(payload.error).not.toMatch(/one post per day/i);
+    expect(context.upload).not.toHaveBeenCalled();
+    expect(
+      context.d1Execute.mock.calls.some((entry) =>
+        (entry[0] as string).startsWith("INSERT INTO post_rate_limits")
+      )
+    ).toBe(false);
+  });
+
+  it("POST returns infra error when the rate-limit reservation insert fails", async () => {
+    const context = configureScenario({
+      rateLimitInsertError: {
+        code: "7500",
+        message: "Cloudflare D1 request failed",
+        details: "internal error; reference = insert-failure-1",
+      },
+    });
+
+    const response = await POST(
+      createPostRequest({
+        noteText: "Insert infra failure branch",
+        imageDataUrl: VALID_IMAGE_DATA_URL,
+      })
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(payload.error).toMatch(/failed to verify rate limit/i);
+    expect(payload.error).not.toMatch(/one post per day/i);
+    expect(context.upload).not.toHaveBeenCalled();
   });
 
   it("POST rejects validation failures for note length and invalid image data", async () => {
