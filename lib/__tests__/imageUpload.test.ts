@@ -60,7 +60,7 @@ describe("image upload abstraction", () => {
         imageBuffer: Buffer.from("fake"),
         fileId: "failing-id",
       })
-    ).rejects.toThrow("Failed to upload drawing image.");
+    ).rejects.toThrow("Failed to upload drawing image: storage error");
 
     await deleteCanvasImage(bucketClient, "2026-03-25/failing-id.png");
     expect(remove).toHaveBeenCalledWith(["2026-03-25/failing-id.png"]);

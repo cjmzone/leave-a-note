@@ -1,22 +1,13 @@
 import { NextRequest } from "next/server";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_NOTE_LENGTH } from "@/lib/constants";
 
 const mocks = vi.hoisted(() => ({
   getClientIp: vi.fn(),
   hashIp: vi.fn(),
-  supabaseAdmin: {
-    from: vi.fn(),
-    storage: {
-      from: vi.fn(),
-    },
-  },
-}));
-
-vi.mock("@/lib/env", () => ({
-  env: {
-    SUPABASE_POST_IMAGES_BUCKET: "post-images",
-  },
+  d1Query: vi.fn(),
+  d1Execute: vi.fn(),
+  createR2BucketClient: vi.fn(),
 }));
 
 vi.mock("@/lib/ip", () => ({
@@ -24,8 +15,13 @@ vi.mock("@/lib/ip", () => ({
   hashIp: mocks.hashIp,
 }));
 
-vi.mock("@/lib/supabaseAdmin", () => ({
-  supabaseAdmin: mocks.supabaseAdmin,
+vi.mock("@/lib/cloudflareD1", () => ({
+  d1Query: mocks.d1Query,
+  d1Execute: mocks.d1Execute,
+}));
+
+vi.mock("@/lib/r2", () => ({
+  createR2BucketClient: mocks.createR2BucketClient,
 }));
 
 import { GET, POST } from "@/app/api/posts/route";
@@ -33,61 +29,56 @@ import * as postsRouteModule from "@/app/api/posts/route";
 
 const VALID_IMAGE_DATA_URL = `data:image/png;base64,${Buffer.from("fake-image-bytes").toString("base64")}`;
 
-type SupabaseScenario = {
+type TestScenario = {
   getPosts?: Array<{ id: string; image_url: string; note_text: string; created_at: string }>;
-  rateLimitError?: { code?: string; message: string } | null;
+  getPostsError?: { code?: string; message: string; details?: string } | null;
+  rateLimitLookupRows?: Array<{ id: string }>;
+  rateLimitLookupError?: { code?: string; message: string; details?: string } | null;
+  rateLimitInsertError?: { code?: string; message: string; details?: string } | null;
   uploadError?: { message: string } | null;
-  insertPostError?: { message: string } | null;
+  insertPostError?: { code?: string; message: string; details?: string } | null;
 };
 
-function configureSupabase(scenario: SupabaseScenario = {}) {
-  const getPosts = scenario.getPosts ?? [];
+function configureScenario(scenario: TestScenario = {}) {
+  mocks.d1Query.mockReset();
+  mocks.d1Execute.mockReset();
+  mocks.createR2BucketClient.mockReset();
 
-  const createdPost = {
-    id: "post-1",
-    image_url: "",
-    note_text: "Hello world",
-    created_at: "2026-03-25T13:00:00.000Z",
-  };
+  mocks.d1Query.mockImplementation(async (sql: string) => {
+    if (sql.startsWith("SELECT id, image_url, note_text, created_at FROM posts")) {
+      if (scenario.getPostsError) {
+        throw scenario.getPostsError;
+      }
 
-  const postRateInsert = vi
-    .fn()
-    .mockResolvedValue({ error: scenario.rateLimitError ?? null });
-  const postRateDeleteEqDate = vi.fn().mockResolvedValue({ error: null });
-  const postRateDeleteEqHash = vi
-    .fn()
-    .mockReturnValue({ eq: postRateDeleteEqDate });
-  const postRateDelete = vi.fn().mockReturnValue({ eq: postRateDeleteEqHash });
+      return scenario.getPosts ?? [];
+    }
 
-  const postsOrder = vi.fn().mockResolvedValue({ data: getPosts, error: null });
-  const postsSelect = vi.fn().mockReturnValue({ order: postsOrder });
+    if (
+      sql.startsWith(
+        "SELECT id FROM post_rate_limits WHERE ip_hash = ? AND last_post_date = ? LIMIT 1"
+      )
+    ) {
+      if (scenario.rateLimitLookupError) {
+        throw scenario.rateLimitLookupError;
+      }
 
-  const postInsertSingle = vi.fn().mockResolvedValue({
-    data:
-      scenario.insertPostError === null || scenario.insertPostError === undefined
-        ? createdPost
-        : null,
-    error: scenario.insertPostError ?? null,
+      return scenario.rateLimitLookupRows ?? [];
+    }
+
+    return [];
   });
-  const postInsertSelect = vi.fn().mockReturnValue({ single: postInsertSingle });
-  const postInsert = vi.fn().mockReturnValue({ select: postInsertSelect });
 
-  mocks.supabaseAdmin.from.mockImplementation((tableName: string) => {
-    if (tableName === "post_rate_limits") {
-      return {
-        insert: postRateInsert,
-        delete: postRateDelete,
-      };
+  mocks.d1Execute.mockImplementation(async (sql: string) => {
+    if (
+      sql.startsWith("INSERT INTO post_rate_limits") &&
+      scenario.rateLimitInsertError
+    ) {
+      throw scenario.rateLimitInsertError;
     }
 
-    if (tableName === "posts") {
-      return {
-        select: postsSelect,
-        insert: postInsert,
-      };
+    if (sql.startsWith("INSERT INTO posts") && scenario.insertPostError) {
+      throw scenario.insertPostError;
     }
-
-    throw new Error(`Unexpected table: ${tableName}`);
   });
 
   const upload = vi.fn().mockResolvedValue({ error: scenario.uploadError ?? null });
@@ -96,19 +87,18 @@ function configureSupabase(scenario: SupabaseScenario = {}) {
     .mockImplementation((path: string) => ({ data: { publicUrl: `https://cdn.example/${path}` } }));
   const remove = vi.fn().mockResolvedValue({ error: null });
 
-  mocks.supabaseAdmin.storage.from.mockReturnValue({
+  mocks.createR2BucketClient.mockReturnValue({
     upload,
     getPublicUrl,
     remove,
   });
 
   return {
-    postRateInsert,
-    postsOrder,
-    postInsert,
     upload,
     getPublicUrl,
     remove,
+    d1Execute: mocks.d1Execute,
+    d1Query: mocks.d1Query,
   };
 }
 
@@ -124,10 +114,18 @@ function createPostRequest(body: Record<string, unknown>): NextRequest {
 }
 
 describe("/api/posts route", () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.getClientIp.mockReturnValue("203.0.113.10");
     mocks.hashIp.mockReturnValue("hashed-ip-value");
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    process.env.NODE_ENV = originalNodeEnv;
+    vi.restoreAllMocks();
   });
 
   it("GET returns posts and requests reverse-chronological ordering", async () => {
@@ -146,20 +144,34 @@ describe("/api/posts route", () => {
       },
     ];
 
-    const supabase = configureSupabase({ getPosts: seededPosts });
+    const context = configureScenario({ getPosts: seededPosts });
 
     const response = await GET();
     const payload = await response.json();
 
     expect(response.status).toBe(200);
     expect(payload.posts).toEqual(seededPosts);
-    expect(supabase.postsOrder).toHaveBeenCalledWith("created_at", {
-      ascending: false,
+    expect(context.d1Query).toHaveBeenCalledWith(
+      "SELECT id, image_url, note_text, created_at FROM posts ORDER BY created_at DESC"
+    );
+  });
+
+  it("GET returns a setup hint in development when placeholders are still in use", async () => {
+    configureScenario({
+      getPostsError: {
+        message: "TypeError: fetch failed your_account_id",
+      },
     });
+
+    const response = await GET();
+    const payload = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(payload.error).toMatch(/replace placeholder values in \.env\.local/i);
   });
 
   it("POST creates a post, uploads an image, and records hashed IP rate limit", async () => {
-    const supabase = configureSupabase();
+    const context = configureScenario();
 
     const response = await POST(
       createPostRequest({
@@ -173,14 +185,18 @@ describe("/api/posts route", () => {
     expect(response.status).toBe(201);
     expect(mocks.getClientIp).toHaveBeenCalledTimes(1);
     expect(mocks.hashIp).toHaveBeenCalledWith("203.0.113.10");
-    expect(supabase.postRateInsert).toHaveBeenCalledWith({
-      ip_hash: "hashed-ip-value",
-      last_post_date: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
-    });
+    expect(context.d1Query).toHaveBeenCalledWith(
+      "SELECT id FROM post_rate_limits WHERE ip_hash = ? AND last_post_date = ? LIMIT 1",
+      ["hashed-ip-value", expect.any(String)]
+    );
 
-    const uploadedPath = supabase.upload.mock.calls[0][0] as string;
+    const d1Calls = context.d1Execute.mock.calls.map((entry) => entry[0] as string);
+    expect(d1Calls.some((sql) => sql.startsWith("INSERT INTO post_rate_limits"))).toBe(true);
+    expect(d1Calls.some((sql) => sql.startsWith("INSERT INTO posts"))).toBe(true);
+
+    const uploadedPath = context.upload.mock.calls[0][0] as string;
     expect(uploadedPath).toMatch(/^\d{4}-\d{2}-\d{2}\/.+\.png$/);
-    expect(supabase.upload).toHaveBeenCalledWith(
+    expect(context.upload).toHaveBeenCalledWith(
       uploadedPath,
       expect.any(Buffer),
       {
@@ -189,16 +205,17 @@ describe("/api/posts route", () => {
       }
     );
 
-    expect(supabase.postInsert).toHaveBeenCalledWith({
+    expect(payload.post).toMatchObject({
       image_url: `https://cdn.example/${uploadedPath}`,
       note_text: "Hello from anonymous user",
     });
-    expect(payload.post).toBeTruthy();
   });
 
-  it("POST blocks a second post on the same day when rate-limit row already exists", async () => {
-    const supabase = configureSupabase({
-      rateLimitError: { code: "23505", message: "duplicate key" },
+  it("POST returns 429 when the daily rate-limit row already exists for the IP hash/date", async () => {
+    process.env.NODE_ENV = "production";
+
+    const context = configureScenario({
+      rateLimitLookupRows: [{ id: "existing-row-id" }],
     });
 
     const response = await POST(
@@ -212,12 +229,120 @@ describe("/api/posts route", () => {
 
     expect(response.status).toBe(429);
     expect(payload.error).toMatch(/one post per day/i);
-    expect(supabase.upload).not.toHaveBeenCalled();
-    expect(supabase.postInsert).not.toHaveBeenCalled();
+    expect(context.upload).not.toHaveBeenCalled();
+    expect(
+      context.d1Execute.mock.calls.some((entry) =>
+        (entry[0] as string).startsWith("INSERT INTO post_rate_limits")
+      )
+    ).toBe(false);
+  });
+
+  it("POST returns 429 on reservation insert conflict (race-safe true rate-limit hit)", async () => {
+    const context = configureScenario({
+      rateLimitInsertError: {
+        message:
+          "UNIQUE constraint failed: post_rate_limits.ip_hash, post_rate_limits.last_post_date",
+      },
+    });
+
+    const response = await POST(
+      createPostRequest({
+        noteText: "Insert conflict branch",
+        imageDataUrl: VALID_IMAGE_DATA_URL,
+      })
+    );
+
+    const payload = await response.json();
+
+    expect(response.status).toBe(429);
+    expect(payload.error).toMatch(/one post per day/i);
+    expect(context.upload).not.toHaveBeenCalled();
+  });
+
+  it("POST bypasses the daily rate-limit check in development mode", async () => {
+    process.env.NODE_ENV = "development";
+
+    const context = configureScenario({
+      rateLimitInsertError: {
+        message:
+          "UNIQUE constraint failed: post_rate_limits.ip_hash, post_rate_limits.last_post_date",
+      },
+    });
+
+    const response = await POST(
+      createPostRequest({
+        noteText: "Development bypass",
+        imageDataUrl: VALID_IMAGE_DATA_URL,
+      })
+    );
+
+    expect(response.status).toBe(201);
+
+    const d1Calls = context.d1Execute.mock.calls.map((entry) => entry[0] as string);
+    expect(d1Calls.some((sql) => sql.startsWith("INSERT INTO post_rate_limits"))).toBe(
+      false
+    );
+    expect(
+      context.d1Query.mock.calls.some((entry) =>
+        (entry[0] as string).startsWith("SELECT id FROM post_rate_limits")
+      )
+    ).toBe(false);
+    expect(context.upload).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST returns infra error when the rate-limit lookup query fails", async () => {
+    const context = configureScenario({
+      rateLimitLookupError: {
+        code: "7500",
+        message: "Cloudflare D1 request failed",
+        details: "internal error; reference = lookup-failure-1",
+      },
+    });
+
+    const response = await POST(
+      createPostRequest({
+        noteText: "Lookup failure branch",
+        imageDataUrl: VALID_IMAGE_DATA_URL,
+      })
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(payload.error).toMatch(/failed to verify rate limit/i);
+    expect(payload.error).not.toMatch(/one post per day/i);
+    expect(context.upload).not.toHaveBeenCalled();
+    expect(
+      context.d1Execute.mock.calls.some((entry) =>
+        (entry[0] as string).startsWith("INSERT INTO post_rate_limits")
+      )
+    ).toBe(false);
+  });
+
+  it("POST returns infra error when the rate-limit reservation insert fails", async () => {
+    const context = configureScenario({
+      rateLimitInsertError: {
+        code: "7500",
+        message: "Cloudflare D1 request failed",
+        details: "internal error; reference = insert-failure-1",
+      },
+    });
+
+    const response = await POST(
+      createPostRequest({
+        noteText: "Insert infra failure branch",
+        imageDataUrl: VALID_IMAGE_DATA_URL,
+      })
+    );
+    const payload = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(payload.error).toMatch(/failed to verify rate limit/i);
+    expect(payload.error).not.toMatch(/one post per day/i);
+    expect(context.upload).not.toHaveBeenCalled();
   });
 
   it("POST rejects validation failures for note length and invalid image data", async () => {
-    configureSupabase();
+    configureScenario();
 
     const tooLongNoteResponse = await POST(
       createPostRequest({
@@ -239,7 +364,7 @@ describe("/api/posts route", () => {
   });
 
   it("POST rolls back rate-limit reservation and uploaded image when DB insert fails", async () => {
-    const supabase = configureSupabase({
+    const context = configureScenario({
       insertPostError: { message: "db failure" },
     });
 
@@ -251,7 +376,12 @@ describe("/api/posts route", () => {
     );
 
     expect(response.status).toBe(500);
-    expect(supabase.remove).toHaveBeenCalledTimes(1);
+    expect(context.remove).toHaveBeenCalledTimes(1);
+
+    const d1Calls = context.d1Execute.mock.calls.map((entry) => entry[0] as string);
+    expect(
+      d1Calls.some((sql) => sql.startsWith("DELETE FROM post_rate_limits"))
+    ).toBe(true);
   });
 
   it("MVP keeps posts permanent by exposing only GET/POST endpoints", () => {

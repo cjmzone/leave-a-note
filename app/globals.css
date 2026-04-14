@@ -1,7 +1,24 @@
+@import url("https://fonts.googleapis.com/css2?family=Caveat:wght@400;700&family=Merriweather:wght@400;700&family=Nunito:wght@400;700&family=Space+Mono:wght@400;700&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --page-bg-top: #fdfcf9;
+  --page-bg-bottom: #eef6ff;
+  --text-main: #0f172a;
+}
+
 body {
-  @apply bg-slate-50 text-slate-900;
+  @apply text-slate-900;
+  background:
+    radial-gradient(circle at 8% 0%, rgba(251, 191, 36, 0.12), transparent 42%),
+    radial-gradient(circle at 92% 18%, rgba(56, 189, 248, 0.12), transparent 38%),
+    linear-gradient(180deg, var(--page-bg-top) 0%, var(--page-bg-bottom) 100%);
+  color: var(--text-main);
+}
+
+::selection {
+  background: rgba(56, 189, 248, 0.25);
 }

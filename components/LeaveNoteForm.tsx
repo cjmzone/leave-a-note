@@ -36,6 +36,7 @@ export default function LeaveNoteForm({ onPostCreated }: LeaveNoteFormProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [isRateLimitModalOpen, setIsRateLimitModalOpen] = useState(false);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -58,6 +59,7 @@ export default function LeaveNoteForm({ onPostCreated }: LeaveNoteFormProps) {
       setIsSubmitting(true);
       setErrorMessage(null);
       setSuccessMessage(null);
+      setIsRateLimitModalOpen(false);
 
       const imageBlob = await boardRef.current.exportImageBlob();
       const imageDataUrl = await convertBlobToDataUrl(imageBlob);
@@ -76,7 +78,22 @@ export default function LeaveNoteForm({ onPostCreated }: LeaveNoteFormProps) {
       const payload = await response.json().catch(() => null);
 
       if (!response.ok) {
-        throw new Error(payload?.error ?? "Could not create the post.");
+        const isDailyRateLimit =
+          response.status === 429 &&
+          typeof payload?.error === "string" &&
+          /one post per day/i.test(payload.error);
+
+        if (isDailyRateLimit) {
+          setErrorMessage(null);
+          setSuccessMessage(null);
+          setIsRateLimitModalOpen(true);
+          return;
+        }
+
+        throw new Error(
+          payload?.error ??
+            `Could not create the post (HTTP ${response.status}). Check server logs for details.`
+        );
       }
 
       onPostCreated(payload.post as Post);
@@ -94,15 +111,15 @@ export default function LeaveNoteForm({ onPostCreated }: LeaveNoteFormProps) {
   }
 
   return (
-    <form className="space-y-4" onSubmit={handleSubmit}>
+    <form className="space-y-5" onSubmit={handleSubmit}>
       <DrawingBoard ref={boardRef} />
 
-      <div className="space-y-2">
-        <label className="block text-sm font-medium text-slate-700" htmlFor="noteText">
+      <div className="space-y-2.5">
+        <label className="block text-sm font-semibold text-slate-700" htmlFor="noteText">
           Short note
         </label>
         <textarea
-          className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm outline-none ring-offset-2 focus:border-slate-500 focus:ring-2 focus:ring-slate-300"
+          className="w-full border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-800 shadow-sm outline-none transition ring-offset-2 placeholder:text-slate-400 focus:border-sky-400 focus:ring-2 focus:ring-sky-200"
           id="noteText"
           maxLength={MAX_NOTE_LENGTH}
           onChange={(event) => setNoteText(event.target.value)}
@@ -111,30 +128,53 @@ export default function LeaveNoteForm({ onPostCreated }: LeaveNoteFormProps) {
           rows={4}
           value={noteText}
         />
-        <p className="text-right text-xs text-slate-500">
+        <p className="text-right text-xs font-medium text-slate-500">
           {noteText.length}/{MAX_NOTE_LENGTH}
         </p>
       </div>
 
       {errorMessage ? (
-        <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+        <p className="border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">
           {errorMessage}
         </p>
       ) : null}
 
       {successMessage ? (
-        <p className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
+        <p className="border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-sm text-emerald-700">
           {successMessage}
         </p>
       ) : null}
 
       <button
-        className="rounded-md bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400"
+        className="w-full bg-slate-900 px-4 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400 sm:w-auto"
         disabled={isSubmitting}
         type="submit"
       >
         {isSubmitting ? "Posting..." : "Post Anonymously"}
       </button>
+
+      {isRateLimitModalOpen ? (
+        <div
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/55 p-4"
+          role="dialog"
+        >
+          <div className="w-full max-w-sm bg-white p-5 shadow-xl">
+            <p className="text-base font-medium text-slate-900">
+              Sorry, you can only make one post a day.
+            </p>
+            <div className="mt-4 flex justify-end">
+              <button
+                className="bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-700"
+                onClick={() => setIsRateLimitModalOpen(false)}
+                type="button"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </form>
   );
 }
