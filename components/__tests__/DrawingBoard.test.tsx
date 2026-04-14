@@ -6,6 +6,22 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import DrawingBoard, { type DrawingBoardHandle } from "@/components/DrawingBoard";
 
+const resizeObserverCallbacks = new Set<ResizeObserverCallback>();
+
+function triggerResizeObserver(target: Element) {
+  for (const callback of resizeObserverCallbacks) {
+    callback(
+      [
+        {
+          target,
+          contentRect: target.getBoundingClientRect(),
+        } as ResizeObserverEntry,
+      ],
+      {} as ResizeObserver
+    );
+  }
+}
+
 vi.mock("p5", () => {
   class MockP5 {
     setup?: () => void;
@@ -21,7 +37,7 @@ vi.mock("p5", () => {
     height = 0;
     ROUND = "round";
 
-    private canvas: HTMLCanvasElement | null = null;
+    canvas: HTMLCanvasElement | null = null;
 
     constructor(sketch: (p: MockP5) => void) {
       sketch(this);
@@ -67,6 +83,16 @@ vi.mock("p5", () => {
     strokeWeight(..._args: unknown[]) {}
     line(..._args: unknown[]) {}
 
+    resizeCanvas(width: number, height: number) {
+      this.width = width;
+      this.height = height;
+
+      if (this.canvas) {
+        this.canvas.width = width;
+        this.canvas.height = height;
+      }
+    }
+
     remove() {
       this.canvas?.remove();
     }
@@ -109,6 +135,7 @@ describe("DrawingBoard text tool", () => {
   let toBlobSpy: ReturnType<typeof vi.spyOn>;
   const originalImage = globalThis.Image;
   const originalFileReader = globalThis.FileReader;
+  const originalResizeObserver = globalThis.ResizeObserver;
 
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -151,6 +178,23 @@ describe("DrawingBoard text tool", () => {
           });
         }
       } as unknown as typeof FileReader
+    );
+
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(private callback: ResizeObserverCallback) {
+          resizeObserverCallbacks.add(callback);
+        }
+
+        observe() {}
+
+        disconnect() {
+          resizeObserverCallbacks.delete(this.callback);
+        }
+
+        unobserve() {}
+      } as unknown as typeof ResizeObserver
     );
 
     const usedFonts: string[] = [];
@@ -234,6 +278,12 @@ describe("DrawingBoard text tool", () => {
       writable: true,
       value: originalFileReader,
     });
+    Object.defineProperty(globalThis, "ResizeObserver", {
+      configurable: true,
+      writable: true,
+      value: originalResizeObserver,
+    });
+    resizeObserverCallbacks.clear();
   });
 
   it("updates brush size continuously via input events while dragging", async () => {
@@ -323,6 +373,116 @@ describe("DrawingBoard text tool", () => {
       expect(resizedWidth).toBeLessThan(startWidth);
       expect(resizedHeight).toBeLessThan(startHeight);
       expect(Math.abs(resizedWidth / resizedHeight - startRatio)).toBeLessThan(0.05);
+    });
+  });
+
+  it("keeps image resize scale consistent across multiple mousemove events", async () => {
+    const user = userEvent.setup();
+    const boardRef = React.createRef<DrawingBoardHandle>();
+    render(<DrawingBoard ref={boardRef} />);
+
+    const pastedFile = new File(["fake-image"], "resize-consistency.png", {
+      type: "image/png",
+    });
+
+    fireEvent.paste(window, {
+      clipboardData: {
+        items: [
+          {
+            type: "image/png",
+            getAsFile: () => pastedFile,
+          },
+        ],
+      },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Text" }));
+    const imageItem = (await screen.findByTestId("canvas-image-item")) as HTMLDivElement;
+    const resizeHandle = await screen.findByTestId("canvas-image-resize");
+    const startWidth = Number.parseFloat(imageItem.style.width);
+
+    fireEvent.mouseDown(resizeHandle, {
+      clientX: 220,
+      clientY: 180,
+    });
+    fireEvent.mouseMove(window, { clientX: 170, clientY: 130 });
+    fireEvent.mouseMove(window, { clientX: 150, clientY: 110 });
+    fireEvent.mouseUp(window);
+
+    const resizedItem = await waitFor(() => {
+      const nextItem = screen.getByTestId("canvas-image-item") as HTMLDivElement;
+      expect(Number.parseFloat(nextItem.style.width)).toBeLessThan(startWidth);
+      return nextItem;
+    });
+
+    const finalWidth = Number.parseFloat(resizedItem.style.width);
+
+    await act(async () => {
+      const blob = await boardRef.current?.exportImageBlob();
+      expect(blob).toBeInstanceOf(Blob);
+    });
+
+    const drawnImageCall = contextMock.drawImage.mock.calls.find(
+      (call) => call.length >= 5 && call[0] instanceof Image
+    );
+    expect(drawnImageCall).toBeTruthy();
+    expect(drawnImageCall?.[3]).toBe(finalWidth);
+  });
+
+  it("resizes the canvas and overlay content when the host width changes", async () => {
+    const user = userEvent.setup();
+    const boardRef = React.createRef<DrawingBoardHandle>();
+    render(<DrawingBoard ref={boardRef} />);
+
+    const canvasHost = await screen.findByTestId("canvas-host");
+
+    const canvas = await waitFor(() => {
+      const nextCanvas = document.querySelector("canvas");
+      expect(nextCanvas).toBeTruthy();
+      return nextCanvas as HTMLCanvasElement;
+    });
+
+    await user.click(screen.getByRole("button", { name: "Text" }));
+    fireEvent.mouseDown(canvas, { clientX: 120, clientY: 90 });
+    await user.type(await screen.findByLabelText("Canvas text"), "Resize me");
+    fireEvent.blur(screen.getByLabelText("Canvas text"));
+
+    const uploadInput = screen.getByLabelText("Upload image file");
+    fireEvent.change(uploadInput, {
+      target: {
+        files: [new File(["fake-image"], "resize.png", { type: "image/png" })],
+      },
+    });
+    await screen.findByTestId("canvas-image-item");
+
+    const beforeText = screen.getByTestId("canvas-text-item") as HTMLDivElement;
+    const beforeImage = screen.getByTestId("canvas-image-item") as HTMLDivElement;
+    const beforeTextLeft = Number.parseFloat(beforeText.style.left);
+    const beforeTextWidth = Number.parseFloat(beforeText.style.width);
+    const beforeImageLeft = Number.parseFloat(beforeImage.style.left);
+    const beforeImageWidth = Number.parseFloat(beforeImage.style.width);
+
+    Object.defineProperty(canvasHost, "clientWidth", {
+      configurable: true,
+      value: 640,
+    });
+    triggerResizeObserver(canvasHost);
+
+    await waitFor(() => {
+      const resizedCanvas = document.querySelector("canvas") as HTMLCanvasElement;
+      expect(resizedCanvas.width).toBe(640);
+    });
+
+    const afterText = screen.getByTestId("canvas-text-item") as HTMLDivElement;
+    const afterImage = screen.getByTestId("canvas-image-item") as HTMLDivElement;
+    expect(Number.parseFloat(afterText.style.left)).toBeGreaterThan(beforeTextLeft);
+    expect(Number.parseFloat(afterText.style.width)).toBeGreaterThan(beforeTextWidth);
+    expect(Number.parseFloat(afterImage.style.left)).toBeGreaterThan(beforeImageLeft);
+    expect(Number.parseFloat(afterImage.style.width)).toBeGreaterThan(beforeImageWidth);
+
+    await act(async () => {
+      const blob = await boardRef.current?.exportImageBlob();
+      expect(blob).toBeInstanceOf(Blob);
     });
   });
 
